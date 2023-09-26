@@ -2,32 +2,23 @@ import tkinter as tk
 from tkinter import filedialog, ttk
 import pandas as pd
 
+def remove_decimal_point_zero(value):
+    if isinstance(value, (float, str)) and str(value).endswith('.0'):
+        return str(value)[:-2]
+    return value
+
+print(remove_decimal_point_zero(25000000829.0))  # This should print: 25000000829
+print(remove_decimal_point_zero("25000000829.0"))  # This should print: 25000000829
+
 def select_source_file():
-    """Function to select source file."""
     path = filedialog.askopenfilename(title="Select Source CSV", filetypes=[("CSV files", "*.csv")])
     source_file_path.set(path)
 
 def select_output_file():
-    """Function to select output file location."""
     path = filedialog.asksaveasfilename(title="Select Output CSV Location", defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
     output_file_path.set(path)
 
-def ensure_continuous_sequence(df):
-    """Ensure that for each DEPTID_CF, there is a continuous sequence of SB_APRV_LEVEL, and add any missing levels."""
-    all_deptids = df['DEPTID_CF'].unique()
-    max_approval_level = df['SB_APRV_LEVEL'].max()
-    all_levels = list(range(1, max_approval_level + 1))
-    all_combinations = pd.MultiIndex.from_product([all_deptids, all_levels], names=['DEPTID_CF', 'SB_APRV_LEVEL'])
-
-    # Drop duplicate rows based on DEPTID_CF and SB_APRV_LEVEL
-    df = df.drop_duplicates(subset=['DEPTID_CF', 'SB_APRV_LEVEL']).set_index(['DEPTID_CF', 'SB_APRV_LEVEL'])
-
-    df_aligned = df.reindex(all_combinations).reset_index()
-    df_aligned = df_aligned.groupby('DEPTID_CF').apply(lambda group: group.ffill()).reset_index(drop=True)
-    return df_aligned
-
 def calculate_limits(business_unit, sb_aprv_level):
-    """Determine the lower and upper limits based on the business unit and approval level."""
     limits = {
         "CHICO": {
             1: (100000.01, 999999999.99),
@@ -44,18 +35,17 @@ def calculate_limits(business_unit, sb_aprv_level):
         "FRATH": {
             1: (100000.01, 999999999.99),
             2: (50000.01, 100000.00),
-            3: (5000.01, 50000.00),
-            4: (0.01, 5000.00)
+            3: (0.01, 50000.00)
         }
     }
-    return limits[business_unit].get(sb_aprv_level, (0, 0))
+    return limits.get(business_unit, {}).get(sb_aprv_level, (0, 0))
 
 def reverse_modify_business_unit(modified_business_unit):
     """Transform modified business unit values back to their original form."""
     reverse_replacements = {
         "CHXCO": "CHICO",
         "FRXNO": "FRSNO",
-        "FRXTH": "FRATH"
+        "FRXTH": "FRSNO"
     }
     return reverse_replacements.get(modified_business_unit, modified_business_unit)
 
@@ -81,36 +71,53 @@ def replace_text(string):
         
     return string
 
+def combine_approvers(df):
+    combined_series = df.groupby(['SB_APRV_LEVEL', 'DEPTID_CF'])['CSU_CALSTEDUPERSID'].apply(lambda x: '|'.join(map(lambda y: remove_decimal_point_zero(str(y)), x))).reset_index()
+    df = pd.merge(df, combined_series, on=['SB_APRV_LEVEL', 'DEPTID_CF'], suffixes=('', '_combined'))
+    df.drop('CSU_CALSTEDUPERSID', axis=1, inplace=True)
+    df.rename(columns={'CSU_CALSTEDUPERSID_combined': 'CSU_CALSTEDUPERSID'}, inplace=True)
+    return df
+
 def transform_data():
-    """Function to process the source file and save the output."""
+    rule_name_counts = {}
     df = pd.read_csv(source_file_path.get(), dtype={'SB_LIMIT_AMT': str})
-    df = ensure_continuous_sequence(df)
+    # Debugging line to print unique CSU_CALSTEDUPERSID values
+    print("Unique CSU_CALSTEDUPERSID values:", df['CSU_CALSTEDUPERSID'].unique())
+    df = combine_approvers(df)
     transformed_data = []
 
     for (sb_aprv_level, csu_calstedupersid, business_unit), group in df.groupby(['SB_APRV_LEVEL', 'CSU_CALSTEDUPERSID', 'BUSINESS_UNIT']):
-        rule_group_name = f"DOA Approval: Level {sb_aprv_level}"
-        rule_name = f"DOA RULE: {csu_calstedupersid}"
-        deptids = group['DEPTID_CF'].unique()
+        print("Value of csu_calstedupersid:", csu_calstedupersid)  # Existing print line
+        print("Data type of csu_calstedupersid:", type(csu_calstedupersid))  # New debugging line
         lower_limit, upper_limit = calculate_limits(business_unit, sb_aprv_level)
-        document_total = f"Between|{lower_limit}|{upper_limit}|USD"
+        document_total = f"Between|{remove_decimal_point_zero(lower_limit)}|{remove_decimal_point_zero(upper_limit)}|USD"
         modified_bu = modify_business_unit(business_unit)
-        
+        deptids = group['DEPTID_CF'].unique()
+
         for i, chunk_deptids in enumerate([deptids[x:x+49] for x in range(0, len(deptids), 49)]):
-            rule_suffix = f":{i+1}" if i > 0 else ""
-            rule_internal_name = f"{rule_name}{rule_suffix}"
-            rule_display_name = f"{rule_name}{rule_suffix}"
-            # Get the actual business unit using reverse mapping
-            actual_bu = reverse_modify_business_unit(modified_bu)
-            deptids_str = f"DeptID|oneOf|{'|'.join([str(val) + '_' + replace_text(business_unit) for val in deptids])}"
+            rule_group_name = f"DOA Approval: Level {remove_decimal_point_zero(sb_aprv_level)}"
+            rule_suffix = f":{str(i+2).zfill(2)}" if i > 0 else ""
+            dept_ids_str = ' '.join(map(remove_decimal_point_zero, deptids))
+            base_rule_name = f"{business_unit.replace('[', '').replace(']', '').replace('. ', ' ')} DOA Approval Level {remove_decimal_point_zero(sb_aprv_level)}"
+            count = rule_name_counts.get(base_rule_name, 0)
+            rule_name_counts[base_rule_name] = count + 1
+            if count > 0:
+                rule_name = f"{base_rule_name}-{count}"
+            else:
+                rule_name = base_rule_name
+            print(rule_name)  # Let's see the value after transformation
+
+            chunk_deptids = [str(int(remove_decimal_point_zero(val))) + '_' + replace_text(business_unit) for val in chunk_deptids]
+            deptids_str = f"DeptID|oneOf|{'|'.join(chunk_deptids)}"
             transformed_data.extend([
-                [rule_group_name, rule_group_name, "", rule_internal_name, rule_display_name, "", csu_calstedupersid, "", "FALSE", "TRUE", "DocumentTotal", document_total],
-                [rule_group_name, rule_group_name, "", rule_internal_name, rule_display_name, "", csu_calstedupersid, "", "FALSE", "TRUE", "BusinessUnit", modified_bu],
-                [rule_group_name, rule_group_name, "", rule_internal_name, rule_display_name, "", csu_calstedupersid, "", "FALSE", "TRUE", "CustomFieldValueMulti", deptids_str]
+                [rule_group_name, rule_group_name, "", rule_name, rule_name, "", csu_calstedupersid, "", "FALSE", "TRUE", "LineTotal", document_total],
+                [rule_group_name, rule_group_name, "", rule_name, rule_name, "", csu_calstedupersid, "", "FALSE", "TRUE", "BusinessUnit", modified_bu],
+                [rule_group_name, rule_group_name, "", rule_name, rule_name, "", csu_calstedupersid, "", "FALSE", "TRUE", "CustomFieldValueMulti", deptids_str]
             ])
 
-    columns = ["Rule Group Internal Name", "Rule Group Display Name", "Rule Group Description", "Rule Internal Name", "Rule Display Name", "Rule Description", "RUle Approvers", "Implicit Approvers", "Auto Approve", "Active", "Type", "Value"]
-    transformed_df = pd.DataFrame(transformed_data, columns=columns)
-    transformed_df.to_csv(output_file_path.get(), index=False)
+    output_df = pd.DataFrame(transformed_data, columns=["Rule Group Internal Name", "Rule Group Display Name", "Rule Group Description", "Rule Internal Name", "Rule Display Name", "Rule Description", "Rule Approvers", "Implicit Approvers", "Auto Approve", "Active", "Type", "Value"])
+    output_df['Value'] = output_df['Value'].apply(replace_text)
+    output_df.to_csv(output_file_path.get(), index=False)
 
 app = tk.Tk()
 app.title("DOA App")
@@ -121,14 +128,17 @@ frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 source_file_path = tk.StringVar()
 output_file_path = tk.StringVar()
 
-ttk.Label(frame, text="Select Source CSV File:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-ttk.Button(frame, text="Browse", command=select_source_file).grid(row=0, column=1, padx=5, pady=5)
-ttk.Label(frame, textvariable=source_file_path).grid(row=0, column=2, padx=5, pady=5)
+# GUI elements for source file path
+ttk.Label(frame, text="Source CSV:").grid(column=0, row=0, sticky=tk.W)
+ttk.Entry(frame, width=40, textvariable=source_file_path).grid(column=1, row=0, sticky=(tk.W, tk.E))
+ttk.Button(frame, text="Browse", command=select_source_file).grid(column=2, row=0, padx=5)
 
-ttk.Label(frame, text="Select Output CSV Location:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-ttk.Button(frame, text="Browse", command=select_output_file).grid(row=1, column=1, padx=5, pady=5)
-ttk.Label(frame, textvariable=output_file_path).grid(row=1, column=2, padx=5, pady=5)
+# GUI elements for output file path
+ttk.Label(frame, text="Output CSV:").grid(column=0, row=1, sticky=tk.W)
+ttk.Entry(frame, width=40, textvariable=output_file_path).grid(column=1, row=1, sticky=(tk.W, tk.E))
+ttk.Button(frame, text="Browse", command=select_output_file).grid(column=2, row=1, padx=5)
 
-ttk.Button(frame, text="Transform Data", command=transform_data).grid(row=2, columnspan=3, pady=10)
+# Execute transformation button
+ttk.Button(frame, text="Transform Data", command=transform_data).grid(column=1, row=2, pady=10)
 
 app.mainloop()
